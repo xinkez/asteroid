@@ -365,6 +365,71 @@ class DPRNN(nn.Module):
         else:
             self.output_act = mask_nl_class()
 
+    @staticmethod
+    def _Segmentation(input, K):
+
+        '''
+            the segmentation stage splits
+            K: chunks of length
+            P: hop size
+            input: [B, N, L]
+            output: [B, N, K, S]
+        '''
+
+        def _padding(input, K):
+            '''
+               padding the audio times
+               K: chunks of length
+               P: hop size
+               input: [B, N, L]
+            '''
+            B, N, L = input.shape
+            P = K // 2
+            gap = K - (P + L % K) % K
+            if gap > 0:
+                pad = torch.Tensor(torch.zeros(B, N, gap)).type(input.type())
+                input = torch.cat([input, pad], dim=2)
+
+            _pad = torch.Tensor(torch.zeros(B, N, P)).type(input.type())
+            input = torch.cat([_pad, input, _pad], dim=2)
+
+            return input, gap
+
+
+        B, N, L = input.shape
+        P = K // 2
+        input, gap = _padding(input, K)
+        # [B, N, K, S]
+        input1 = input[:, :, :-P].contiguous().view(B, N, -1, K)
+        input2 = input[:, :, P:].contiguous().view(B, N, -1, K)
+        input = torch.cat([input1, input2], dim=3).view(
+            B, N, -1, K).transpose(2, 3)
+
+        return input.contiguous(), gap
+
+    @staticmethod
+    def _over_add(input, gap):
+        '''
+           Merge sequence
+           input: [B, N, K, S]
+           gap: padding length
+           output: [B, N, L]
+        '''
+        B, N, K, S = input.shape
+        P = K // 2
+        # [B, N, S, K]
+        input = input.transpose(2, 3).contiguous().view(B, N, -1, K * 2)
+
+        input1 = input[:, :, :, :K].contiguous().view(B, N, -1)[:, :, P:]
+        input2 = input[:, :, :, K:].contiguous().view(B, N, -1)[:, :, :-P]
+        input = input1 + input2
+        # [B, N, L]
+        if gap > 0:
+            input = input[:, :, :-gap]
+
+        return input
+
+
     def forward(self, mixture_w):
         """
         Args:
@@ -376,8 +441,7 @@ class DPRNN(nn.Module):
         """
         batch, n_filters, n_frames = mixture_w.size()
         output = self.bottleneck(mixture_w)  # [batch, bn_chan, n_frames]
-        output = unfold(output.unsqueeze(-1), kernel_size=(self.chunk_size, 1),
-                        padding=(self.chunk_size, 0), stride=(self.hop_size, 1))
+        output, gap = self._Segmentation(output, self.chunk_size)
         n_chunks = output.size(-1)
         output = output.reshape(batch, self.bn_chan, self.chunk_size, n_chunks)
         # Apply stacked DPRNN Blocks sequentially
@@ -387,13 +451,9 @@ class DPRNN(nn.Module):
                                 self.chunk_size, n_chunks)
         # Overlap and add:
         # [batch, out_chan, chunk_size, n_chunks] -> [batch, out_chan, n_frames]
-        to_unfold = self.out_chan * self.chunk_size
-        output = fold(output.reshape(batch * self.n_src, to_unfold, n_chunks),
-                      (n_frames, 1), kernel_size=(self.chunk_size, 1),
-                      padding=(self.chunk_size, 0),
-                      stride=(self.hop_size, 1))
+        output = self._over_add(output, gap)
         # Normalization
-        output = output.squeeze(-1) / (self.chunk_size / self.hop_size)
+        #output = output.squeeze(-1) / (self.chunk_size / self.hop_size)
         score = output.view(batch, self.n_src, self.out_chan, n_frames)
         est_mask = self.output_act(score)
         return est_mask
@@ -459,3 +519,6 @@ class ChimeraPP(nn.Module):
         mask_out = self.mask_layer(out)
         mask_out = mask_out.view(batches, self.n_src, self.input_dim, seq_cnt)
         return projection_final, mask_out
+
+
+

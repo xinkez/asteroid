@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from torch.nn.functional import fold, unfold
-
 from . import norms, activations
 from ..utils import has_arg
 
@@ -284,42 +283,58 @@ class DPRNNBlock(nn.Module):
         return output + x
 
 
-class DPRNN(nn.Module):
-    """ Dual-path RNN Network for Single-Channel Source Separation
-
-        Method introduced in [1].
-
-    Args:
-        in_chan (int): Number of input filters.
-        n_src (int): Number of masks to estimate.
-        out_chan  (int or None): Number of bins in the estimated masks.
-            Defaults to `in_chan`.
-        bn_chan (int): Number of channels after the bottleneck.
-            Defaults to 128.
-        hid_size (int): Number of neurons in the RNNs cell state.
-            Defaults to 128.
-        chunk_size (int): window size of overlap and add processing.
-            Defaults to 100.
-        hop_size (int or None): hop size (stride) of overlap and add processing.
-            Default to `chunk_size // 2` (50% overlap).
-        n_repeats (int): Number of repeats. Defaults to 6.
-        norm_type (str, optional): Type of normalization to use. To choose from
-
-            - ``'gLN'``: global Layernorm
-            - ``'cLN'``: channelwise Layernorm
-        mask_act (str, optional): Which non-linear function to generate mask.
-        bidirectional (bool, optional): True for bidirectional Inter-Chunk RNN
-            (Intra-Chunk is always bidirectional).
-        rnn_type (str, optional): Type of RNN used. Choose between ``'RNN'``,
-            ``'LSTM'`` and ``'GRU'``.
-        num_layers (int, optional): Number of layers in each RNN.
-        dropout (float, optional): Dropout ratio, must be in [0,1].
-
-    References:
-        [1] "Dual-path RNN: efficient long sequence modeling for
-        time-domain single-channel speech separation", Yi Luo, Zhuo Chen
-        and Takuya Yoshioka. https://arxiv.org/abs/1910.06379
+class SingleRNNLuo(nn.Module):
     """
+    Container module for a single RNN layer.
+
+    args:
+        rnn_type: string, select from 'RNN', 'LSTM' and 'GRU'.
+        input_size: int, dimension of the input feature. The input should have shape
+                    (batch, seq_len, input_size).
+        hidden_size: int, dimension of the hidden state.
+        dropout: float, dropout ratio. Default is 0.
+        bidirectional: bool, whether the RNN layers are bidirectional. Default is False.
+    """
+
+    def __init__(self, rnn_type, input_size, hidden_size, dropout=0, bidirectional=False):
+        super(SingleRNNLuo, self).__init__()
+
+        self.rnn_type = rnn_type
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_direction = int(bidirectional) + 1
+
+        self.rnn = getattr(nn, rnn_type)(input_size, hidden_size, 1, dropout=dropout, batch_first=True,
+                                         bidirectional=bidirectional)
+
+        # linear projection layer
+        self.proj = nn.Linear(hidden_size * self.num_direction, input_size)
+
+    def forward(self, input):
+        # input shape: batch, seq, dim
+        output = input
+        rnn_output, _ = self.rnn(output)
+        rnn_output = self.proj(rnn_output.contiguous().view(-1, rnn_output.shape[2])).view(output.shape)
+        return rnn_output
+
+
+
+
+class DPRNN(nn.Module):
+    """
+    Deep duaL-path RNN.
+
+    args:
+        rnn_type: string, select from 'RNN', 'LSTM' and 'GRU'.
+        input_size: int, dimension of the input feature. The input should have shape
+                    (batch, seq_len, input_size).
+        hidden_size: int, dimension of the hidden state.
+        output_size: int, dimension of the output size.
+        dropout: float, dropout ratio. Default is 0.
+        num_layers: int, number of stacked RNN layers. Default is 1.
+        bidirectional: bool, whether the RNN layers are bidirectional. Default is False.
+    """
+
     def __init__(self, in_chan, n_src, out_chan=None, bn_chan=128, hid_size=128,
                  chunk_size=100, hop_size=None, n_repeats=6, norm_type="gLN",
                  mask_act='sigmoid', bidirectional=True, rnn_type="LSTM",
@@ -341,20 +356,26 @@ class DPRNN(nn.Module):
         self.rnn_type = rnn_type
         self.num_layers = num_layers
         self.dropout = dropout
+        super(DPRNN, self).__init__()
 
         layer_norm = norms.get(norm_type)(in_chan)
         bottleneck_conv = nn.Conv1d(in_chan, bn_chan, 1)
         self.bottleneck = nn.Sequential(layer_norm, bottleneck_conv)
 
-        # Succession of DPRNNBlocks.
-        net = []
-        for x in range(self.n_repeats):
-            net += [DPRNNBlock(bn_chan, hid_size, norm_type=norm_type,
-                               bidirectional=bidirectional, rnn_type=rnn_type,
-                               num_layers=num_layers, dropout=dropout)]
-        self.net = nn.Sequential(*net)
+        # dual-path RNN from Luo
+        self.row_rnn = nn.ModuleList([])
+        self.col_rnn = nn.ModuleList([])
+        self.row_norm = nn.ModuleList([])
+        self.col_norm = nn.ModuleList([])
+        for i in range(n_repeats):
+            self.row_rnn.append(SingleRNNLuo(rnn_type, bn_chan, hid_size, dropout,
+                                          bidirectional=True))  # intra-segment RNN is always noncausal
+            self.col_rnn.append(SingleRNNLuo(rnn_type, bn_chan, hid_size, dropout, bidirectional=bidirectional))
+            self.row_norm.append(nn.GroupNorm(1, bn_chan, eps=1e-8))
+            # default is to use noncausal LayerNorm for inter-chunk RNN. For causal setting change it to causal normalization techniques accordingly.
+            self.col_norm.append(nn.GroupNorm(1, bn_chan, eps=1e-8))
 
-        mask_conv = nn.Conv2d(bn_chan, n_src*out_chan, 1)
+        mask_conv = nn.Conv2d(bn_chan, n_src * out_chan, 1)
         self.mask_net = nn.Sequential(nn.PReLU(), mask_conv)
 
         # Get activation function.
@@ -395,7 +416,6 @@ class DPRNN(nn.Module):
 
             return input, gap
 
-
         B, N, L = input.shape
         P = K // 2
         input, gap = _padding(input, K)
@@ -429,32 +449,41 @@ class DPRNN(nn.Module):
 
         return input
 
-
     def forward(self, mixture_w):
-        """
-        Args:
-            mixture_w (:class:`torch.Tensor`): Tensor of shape
-                [batch, n_filters, n_frames]
-        Returns:
-            :class:`torch.Tensor`
-                estimated mask of shape [batch, n_src, n_filters, n_frames]
-        """
-        batch, n_filters, n_frames = mixture_w.size()
+        # input shape: batch, N, dim1, dim2
+        # apply RNN on dim1 first and then dim2
+
+
+
         output = self.bottleneck(mixture_w)  # [batch, bn_chan, n_frames]
-        output, gap = self._Segmentation(output, self.chunk_size)
-        n_chunks = output.size(-1)
-        output = output.reshape(batch, self.bn_chan, self.chunk_size, n_chunks)
-        # Apply stacked DPRNN Blocks sequentially
-        output = self.net(output)
-        output = self.mask_net(output)
-        output = output.reshape(batch * self.n_src, self.out_chan,
-                                self.chunk_size, n_chunks)
+        n_frames = output.size(-1)
+        inp, gap = self._Segmentation(output, self.chunk_size)
+
+        batch_size, _, dim1, dim2 = inp.shape
+        output = inp
+        for i in range(len(self.row_rnn)):
+            row_input = output.permute(0, 3, 2, 1).contiguous().view(batch_size * dim2, dim1, -1)  # B*dim2, dim1, N
+            row_output = self.row_rnn[i](row_input)  # B*dim2, dim1, H
+            row_output = row_output.view(batch_size, dim2, dim1, -1).permute(0, 3, 2,
+                                                                             1).contiguous()  # B, N, dim1, dim2
+            row_output = self.row_norm[i](row_output)
+            output = output + row_output
+
+            col_input = output.permute(0, 2, 3, 1).contiguous().view(batch_size * dim1, dim2, -1)  # B*dim1, dim2, N
+            col_output = self.col_rnn[i](col_input)  # B*dim1, dim2, H
+            col_output = col_output.view(batch_size, dim1, dim2, -1).permute(0, 3, 1,
+                                                                             2).contiguous()  # B, N, dim1, dim2
+            col_output = self.col_norm[i](col_output)
+            output = output + col_output
+
+        output = output.reshape(batch_size * self.n_src, self.out_chan,
+                                self.chunk_size, dim2)
         # Overlap and add:
         # [batch, out_chan, chunk_size, n_chunks] -> [batch, out_chan, n_frames]
         output = self._over_add(output, gap)
         # Normalization
-        #output = output.squeeze(-1) / (self.chunk_size / self.hop_size)
-        score = output.view(batch, self.n_src, self.out_chan, n_frames)
+        # output = output.squeeze(-1) / (self.chunk_size / self.hop_size)
+        score = output.view(batch_size, self.n_src, self.out_chan, n_frames)
         est_mask = self.output_act(score)
         return est_mask
 
@@ -519,6 +548,4 @@ class ChimeraPP(nn.Module):
         mask_out = self.mask_layer(out)
         mask_out = mask_out.view(batches, self.n_src, self.input_dim, seq_cnt)
         return projection_final, mask_out
-
-
 
